@@ -1,0 +1,300 @@
+#!/usr/bin/python
+
+import argparse
+import mailbox
+import email
+from email import utils
+import os
+import re
+import sys
+from imapclient import imap_utf7
+
+#MBOX = '/var/spool/mail/nmamiya'
+procmailrc = '/home/' + os.environ['USER'] + '/.procmailrc'
+MBOX = '/home/' + os.environ['USER'] + '/Mail/'
+MAILDIR = '/home/' + os.environ['USER'] + '/Maildir/'
+
+# 検索パターン引数解析のための関数
+# ヘッダ，検索パターン のタプルを返す（検索パターン省略時は '.*' とする）
+def str_tuple(str):
+    t = (str + ',').split(',')
+    if t[1] == '':
+        t[1] = '.*'
+    return tuple(t)
+
+# 対象メールボックス形式引数の解析のための関数
+def frm_mbox(str):
+    if str == 'mbox':
+        return 'mbox'
+    if str == 'maildir':
+        return 'maildir'
+    exit(1)
+
+# 指定ディレクトリ以下の全ファイルを返すイテレータ関数
+def find_all_files(path):
+    for root, dirs, files in os.walk(path):
+        yield root
+        for file in files:
+            yield os.path.join(root, file)
+
+# argparse
+parser = argparse.ArgumentParser(description = 'mailbox(Maidir:mbox) 編集プログラム')
+parser.add_argument('mailbox', help='対象メールボックス', nargs='?', default='')
+parser.add_argument('--frm', help='対象形式(mbox|maildir)', type=frm_mbox, default='maildir')
+parser.add_argument('--to', help='出力対象形式(mbox|maildir)', type=frm_mbox, default='maildir')
+parser.add_argument('--head', help='解析対象ヘッダ/検索パターン（複数指定可）- 検索パターン省略可', nargs='*', type=str_tuple, metavar='HEAD,PATTERN')
+parser.add_argument('--list', help='フォルダーリスト', action='store_true')
+parser.add_argument('--print', help='結果を表示する', action='store_true')
+parser.add_argument('--output', help='指定したメールボックスに出力（移動の場合は --delete を併用）')
+parser.add_argument('--delete', help='削除', action='store_true')
+parser.add_argument('-v', '--verbose', help='確認のみ', action='store_true')
+parser.add_argument('--procmail', help='.procmailrc の内容でメールボックスを解析する', action='store_true')
+parser.add_argument('--procmove', help='.procmailrc の内容で出力先へコピー（移動の場合は --delete を併用）', action='store_true')
+parser.add_argument('--conv', help='mbox to  Maildir コンバートユーティリティ', action='store_true')
+args = parser.parse_args()
+
+# option '--conv'
+# このオプションは mbox 形式のimapフォルダの ~/Mail/ から Maildir 形式の
+# ~/Maildir/ に階層ごとコピーする。他のオプションは無視する
+# また mbox の inbox は対象外なので 
+# $ mailboxutil --frm mbox --head 'From' --print --to maildir --output ''
+# などで個別コピーする
+if args.conv:
+    print('mbox to  Maildir コンバートユーティリティ')
+    choice = input('Please respond with \'yes\' or \'no\' [y/N]:').lower()
+    if choice in ['y', 'ye', 'yes']:
+        print('Maildir コンバートを実行します')
+    else:
+        exit(0)
+    for p in find_all_files(MBOX): # コピー対象の mbox ディレクトリ以下の全ファイルを繰り返し処理
+        if os.path.isfile(p) and os.path.getsize(p) > 0:
+            mb = mailbox.mbox(p)
+            if len(mb.keys()) > 0: # サイズゼロでない通常ファイルをmboxとして処理する
+                j = imap_utf7.decode(p.encode())
+                jn = '.' + '.'.join(j[len(MBOX):].split('/')) # 変換先の Maildir メールボックスフォルダ名を生成
+                mdn = imap_utf7.encode(jn).decode()
+                print(j + ' => ' + mdn)
+                mdn = MAILDIR + mdn
+                mdr = mailbox.Maildir(mdn)
+                # 変換元のメールボックスの key を Dateフィールドでソートして繰り返し処理
+                for key in sorted(mb.keys(), key=lambda k: utils.parsedate(mb[k]['Date']) or (0,0,0,0,0,0,0,0,0)):
+                    msg = mb.get_message(key)
+                    date1 = utils.parsedate_to_datetime(mes1['Date']).timestamp()
+                    if type(mdr) is mailbox.Maildir: # Maildir 形式の場合は個別ファイルのタイムスタンプを合せる
+                        if date1 > 0:
+                            msg.set_date(date1)
+                    mdr.add(msg) # 変換先のメールボックスに保存
+                    sys.stderr.write(str(key) + '\r')
+
+    exit(0)
+
+# option '--list'
+# メールボックス内のフォルダリストを表示（utf7デコード）
+if args.list:
+    if args.frm == 'mbox':
+        path = MBOX + args.mailbox
+    else:
+        path = MAILDIR + args.mailbox
+    path = imap_utf7.encode(path).decode()
+    if os.path.isdir(path):
+        for fn in os.listdir(path):
+            info = ''
+            if os.path.isdir(path + '/' + fn):
+                info = '(d)'
+            if os.path.isfile(path + '/' + fn):
+                info = str(os.path.getsize(path + '/' + fn))
+            print(info + ' :' + imap_utf7.decode(fn.encode()) + '  :  ' + fn)
+    exit()
+
+# option '--output'
+# 出力先のメールボックス作成
+outbox = ''
+if args.output:
+    if args.to == 'mbox':
+        outpath = MBOX + args.output
+    else:
+        outpath = MAILDIR + args.output
+    outfile = imap_utf7.encode(outpath).decode()
+    print(outfile)
+    outbox = mailbox.mbox(outfile) if args.to == 'mbox' else mailbox.Maildir(outfile)
+    
+# option '--procmail'
+procdict = {}  # 宛先変数辞書
+procact = []   # ((ヘッダ、パターン)タプル配列, 宛先変数)タプル配列
+if args.procmail and os.path.isfile(procmailrc):
+    #print(procmailrc)
+    proc_reg = []
+    proc_dst = ''
+    with open(procmailrc) as pf:
+        print(type(pf))
+        for ln in filter(lambda s: re.search('\S+', s) and re.match('^[^#].*', s),  map(lambda l: l.strip(), pf.readlines())):
+            # 変数マッチ
+            rres = re.match('^([A-Z_]+)=(.+)$', ln)
+            if rres:
+                pth = rres.group(2)
+                pres = re.match('.*(\$[A-Z][A-Z][A-Z]+).*', pth)
+                if pres:
+                    env = pres.group(1)
+                    env1 = env[1:]
+                    if env1 == 'HOME':
+                        pth = pth.replace(env, os.environ[env1])
+                    if env1 == 'MAILDIR':
+                        pth = pth.replace(env, MAILDIR[:-1] if MAILDIR[-1] == '/' else MAILDIR)
+                    sres = re.match('^(.+)\/new\/.*$', pth)
+                    if sres:
+                        pth = sres.group(1)
+                procdict[rres.group(1)] = pth
+            # 移動先マッチ
+            if re.match('^:0', ln):
+                proc_reg = []
+                proc_act = ''
+            rres = re.match('^\* \^(.+):(.+)$', ln)
+            if rres:
+                proc_reg.append((rres.group(1), rres.group(2)))
+                #print((rres.group(1), rres.group(2)))
+            rres = re.match('^\$([A-Z_]+)$', ln)
+            if rres:
+                proc_dst = rres.group(1)
+                if len(proc_reg) > 0:
+                    procact.append((proc_reg, proc_dst))
+
+mboxfile = ''
+if args.frm == 'mbox':
+    mboxfile = '/var/spool/mail/' + os.environ['USER'] \
+        if args.mailbox == '' or args.mailbox == os.environ['USER'] \
+        else '~/Mail/' + args.mailbox
+else:
+    mboxfile = '~/Maildir/' + args.mailbox
+
+mboxfile = imap_utf7.encode(mboxfile).decode()
+
+# print(mboxfile)
+
+#for fn in os.listdir('Mail'):
+#    print(imap_utf7.decode(fn.encode()))
+
+mbx = mailbox.mbox(mboxfile) if args.frm == 'mbox' else mailbox.Maildir(mboxfile)
+
+proc_action = []
+tgtkeys = []
+keyfg = False
+# ヘッダをMIMEデコードして表示
+#for key in mbx.iterkeys():
+for key in sorted(mbx.keys(), key=lambda k: utils.parsedate(mbx[k]['Date']) or (0,0,0,0,0,0,0,0,0)):
+    # --head option
+    msg = mbx.get_message(key)
+    for headtp in (args.head or []):
+        keyfg = False
+        #msg = mbx.get_message(key)
+        if len(headtp) > 0 and headtp[0] in msg.keys():
+            head1 = msg[headtp[0]]
+            htups = email.header.decode_header(head1)
+            try:
+                res = ''.join([tp[0].decode(tp[1]) if tp[1]\
+                        else tp[0].decode() if type(tp[0]) is bytes\
+                        else tp[0] if type(tp[0]) == str else '' for tp in htups])
+            except LookupError:
+                res = 'decode error : ' + str(head1)
+            except UnicodeDecodeError:
+                res = 'decode error : ' + str(head1)
+            if len(headtp) > 1 and re.search(headtp[1] ,res):
+                if args.print:
+                    print((msg['Date'] or '') + ' : ' + (msg['X-Spam-Level'] or '') + ' : ' + res)
+                tgtkeys.append(key)
+                keyfg = True
+                break
+        if keyfg:
+            continue
+    # --procmail option
+    for act in procact:
+        regs, dist = act
+        #print(regs)
+        mat = True
+        mes = ''
+        for reg in regs:
+            head, reg1 = reg
+            head1 = msg[head] or ''
+            #if head1 is None:
+            #    continue
+            htups = email.header.decode_header(head1)
+            try:
+                res = ''.join([tp[0].decode(tp[1]) if tp[1]\
+                        else tp[0].decode() if type(tp[0]) is bytes\
+                        else tp[0] if type(tp[0]) == str else '' for tp in htups])
+            except LookupError:
+                res = 'decode error : ' + str(head1)
+            except UnicodeDecodeError:
+                res = 'decode error : ' + str(head1)
+            if re.search(reg1, res):
+                if args.print:
+                    mes = msg['Date'] + ' : ' + (msg['X-Spam-Level'] or '') + ' : ' + res + ' -> ' + procdict[dist]
+            else:
+                mat = False
+        if mat:
+            if mes != '':
+                print(mes)
+                proc_action.append((key, procdict[dist]))
+                break
+
+for key in tgtkeys:
+    mes = str(key)
+    if args.output:
+        mes1 = mbx.get_message(key)
+        d1 = mes1['Date']
+        date1 = 0
+        if d1 is not None:
+            date1 = utils.parsedate_to_datetime(mes1['Date']).timestamp()
+        if type(outbox) is mailbox.Maildir: # Maildir 形式の場合は個別ファイルのタイムスタンプを合せる
+            if date1 > 0:
+                mes1.set_date(date1)
+        outbox.add(mes1)
+        mes += ' : output to ' + args.output 
+    if args.delete:
+        mbx.lock()
+        mbx.discard(key)
+        mbx.unlock()
+        mes += ' and deleted.'
+    if args.output is None and not args.delete:
+        mes += ' : nothing to do.'
+    if args.verbose:
+        print(mes)
+
+mbx.flush()
+if args.output:
+    outbox.flush()
+
+# procmail対応後処理
+for p in proc_action:
+    key, dist = p
+    dist1 = dist
+    rres = re.match('^.*(&.+)$', dist)
+    if rres:
+        dist1 = dist.replace(rres.group(1), imap_utf7.decode(rres.group(1).encode()))
+    print(str(key) + ' ==> ' + dist1)
+    #continue
+    if args.procmove:
+        procbox = None
+        if args.to == 'mbox':
+            procbox = mailbox.mbox(MBOX + dist)
+        else:
+            procbox = mailbox.Maildir(MAILDIR + dist)
+        #continue
+        mes1 = mbx.get_message(key)
+        date1 = utils.parsedate_to_datetime(mes['Date']).timestamp()
+        if type(procbox) is mailbox.Maildir:
+            if date1 > 0:
+                mes1.set_date(date1)
+        procbox.add(mes1)
+        procbox.flush()
+        #mbx.lock()
+        #mbx.discard(key)
+        #mbx.unlock()
+        print('done.')
+    if args.delete:
+        mbx.lock()
+        mbx.discard(key)
+        mbx.unlock()
+        print('delete.')
+                                 
+mbx.flush()
+
